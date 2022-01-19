@@ -3041,7 +3041,7 @@ static ssize_t p9221_show_version(struct device *dev,
 	struct p9221_charger_data *charger = i2c_get_clientdata(client);
 	int count = 0;
 	int i;
-	int ret;
+	int __maybe_unused ret;
 	u8 val8 = 0;
 
 	if (!p9221_is_online(charger))

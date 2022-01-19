@@ -1292,7 +1292,7 @@ static void max1720x_restore_battery_qh_capacity(struct max1720x_chip *chip)
 static void max1720x_handle_update_nconvgcfg(struct max1720x_chip *chip,
 					     int temp)
 {
-	int idx = -1, hysteresis_temp;
+	int idx = -1, __maybe_unused hysteresis_temp;
 
 	if (chip->temp_convgcfg == NULL)
 		return;

@@ -507,7 +507,7 @@ static int gbms_storage_flush_all_internal(bool force)
 int gbms_storage_flush(gbms_tag_t tag)
 {
 	unsigned long flags;
-	int ret;
+	int __maybe_unused ret;
 
 	if (!gbms_storage_init_done)
 		return -EPROBE_DEFER;
