@@ -90,6 +90,14 @@ struct gbms_chg_profile {
 #define CHG_EV_ADAPTER_STRING(s)	#s
 #define _CHG_EV_ADAPTER_PRIMITIVE_CAT(a, ...) a ## __VA_ARGS__
 
+#define BATTERY_DEBUG_ATTRIBUTE(name, fn_read, fn_write) \
+static const struct file_operations name = {	\
+	.open	= simple_open,			\
+	.llseek	= no_llseek,			\
+	.read	= fn_read,			\
+	.write	= fn_write,			\
+}
+
 /* Enums will start with CHG_EV_ADAPTER_TYPE_ */
 #define CHG_EV_ADAPTER_ENUM(e)	\
 			_CHG_EV_ADAPTER_PRIMITIVE_CAT(CHG_EV_ADAPTER_TYPE_,e)
@@ -216,6 +224,24 @@ struct batt_ttf_stats {
 	struct logbuffer *ttf_log;
 };
 
+#pragma pack(1)
+struct max17x0x_eeprom_history {
+	u16 tempco;
+	u16 rcomp0;
+	u8 timerh;
+	unsigned fullcapnom:10;
+	unsigned fullcaprep:10;
+	unsigned mixsoc:6;
+	unsigned vfsoc:6;
+	unsigned maxvolt:4;
+	unsigned minvolt:4;
+	unsigned maxtemp:4;
+	unsigned mintemp:4;
+	unsigned maxchgcurr:4;
+	unsigned maxdischgcurr:4;
+};
+#pragma pack()
+
 /*
  * health based charging can be enabled from userspace with a deadline
  *
@@ -272,6 +298,12 @@ enum gbms_stats_tier_idx_t {
 	GBMS_STATS_AC_TI_V2_PREDICT_SUCCESS = 19,
 	GBMS_STATS_AC_TI_DONE_AON = 20,
 
+	/* Thermal stats, reported from google_charger */
+	GBMS_STATS_TH_LVL0 = 50,
+	GBMS_STATS_TH_LVL1 = 51,
+	GBMS_STATS_TH_LVL2 = 52,
+	GBMS_STATS_TH_LVL3 = 53,
+
 	/* TODO: rename, these are not really related to AC */
 	GBMS_STATS_AC_TI_FULL_CHARGE = 100,
 	GBMS_STATS_AC_TI_HIGH_SOC = 101,
@@ -282,15 +314,6 @@ enum gbms_stats_tier_idx_t {
 	GBMS_STATS_BD_TI_TRICKLE = 112,
 
 	GBMS_STATS_BD_TI_TRICKLE_CLEARED = 122,
-};
-
-enum natt_csi_type {
-	CSIType_None = 0,	// Disconnected
-	CSIType_Fault = 1,	// Internal Failures
-	CSIType_JEITA = 2,	// HW limits
-	CSIType_LongLife = 3,	// DefenderConditions
-	CSIType_Adaptive = 4,	// AdaptiveCharging
-	CSIType_Normal = 5,
 };
 
 /* health state */
@@ -357,8 +380,11 @@ struct gbms_charging_event {
 	struct gbms_ce_tier_stats trickle_stats;
 };
 
-#define GBMS_CCCM_LIMITS(profile, ti, vi) \
+#define GBMS_CCCM_LIMITS_SET(profile, ti, vi) \
 	profile->cccm_limits[(ti * profile->volt_nb_limits) + vi]
+
+#define GBMS_CCCM_LIMITS(profile, ti, vi) \
+	(ti >= 0 && vi >= 0) ? profile->cccm_limits[(ti * profile->volt_nb_limits) + vi] : 0
 
 /* newgen charging */
 #define GBMS_CS_FLAG_BUCK_EN	BIT(0)
@@ -493,6 +519,17 @@ ssize_t ttf_dump_details(char *buf, int max_size,
 			 const struct batt_ttf_stats *ttf_stats,
 			 int last_soc);
 
+int ttf_pwr_vtier_idx(const struct batt_ttf_stats *stats, int soc);
+
+int ttf_ref_cc(const struct batt_ttf_stats *stats, int soc);
+
+int ttf_pwr_ibatt(const struct gbms_ce_tier_stats *ts);
+
+int gbms_read_aacr_limits(struct gbms_chg_profile *profile,
+			  struct device_node *node);
+
+bool chg_state_is_disconnected(const union gbms_charger_state *chg_state);
+
 /*
  * Charger modes
  *
@@ -520,25 +557,31 @@ enum bhi_status {
 
 enum csi_type {
 	CSI_TYPE_UNKNOWN = -1,
+
 	CSI_TYPE_None = 0,		// Disconnected
 	CSI_TYPE_Fault = 1,		// Internal Failures
-	CSI_TYPE_JEITA = 2,		// HW limits
+	CSI_TYPE_JEITA = 2,		// HW limits (will have HOT or COLD)
 	CSI_TYPE_LongLife = 3, 		// DefenderConditions
 	CSI_TYPE_Adaptive = 4,		// AdaptiveCharging
-	CSI_TYPE_Normal = 5,
+	CSI_TYPE_Normal = 5,		// All Good
 };
 
 enum csi_status {
 	CSI_STATUS_UNKNOWN = -1,
-	CSI_STATUS_Discharging = 0,
-	CSI_STATUS_Health_Cold = 10,	// JEITA battery, mutex with Hot
-	CSI_STATUS_Health_Hot = 11,	// JEITA battery, mutex with Cold
-	CSI_STATUS_System_Thermals = 20,//
-	CSI_STATUS_System_Load = 21,	// Load will eventually become thermals
-	CSI_STATUS_Adapter_Power = 30,	//
-	CSI_STATUS_Adapter_Quality = 31,// Adapter or cable (low voltage)
-	CSI_STATUS_Adapter_Auth = 32,	// Missing authentication (if supported)
-	CSI_STATUS_Normal = 100,	//
+
+	CSI_STATUS_Health_Cold = 10,	// battery temperature not nominal
+	CSI_STATUS_Health_Hot = 11,	// battery temperature not nominal
+	CSI_STATUS_System_Thermals = 20,// Thermal engine
+	CSI_STATUS_System_Load = 21,	// Load might eventually become thermals
+	CSI_STATUS_Adapter_Auth = 30,	// During authentication
+	CSI_STATUS_Adapter_Power = 31,	// Low power adapter
+	CSI_STATUS_Adapter_Quality = 32,// Adapter or cable (low input voltage)
+	CSI_STATUS_Defender_Temp = 40,	// TEMP Defend
+	CSI_STATUS_Defender_Dwell = 41,	// DWELL Defend
+	CSI_STATUS_Defender_Trickle = 42,
+	CSI_STATUS_Defender_Dock = 43,	// Dock Defend
+	CSI_STATUS_NotCharging = 100,	// There will be a more specific reason
+	CSI_STATUS_Charging = 200,	// All good
 };
 
 #endif  /* __GOOGLE_BMS_H_ */

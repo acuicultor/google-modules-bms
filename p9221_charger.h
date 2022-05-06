@@ -18,7 +18,7 @@
 
 #include <linux/gpio.h>
 #include <linux/crc8.h>
-#include "pmic-voter.h" /* TODO(b/163679860): use gvotables */
+#include <misc/gvotable.h>
 #include "gbms_power_supply.h"
 
 #define P9221_WLC_VOTER				"WLC_VOTER"
@@ -31,6 +31,7 @@
 #define DD_VOTER				"DD_VOTER"
 #define AUTH_DC_ICL_VOTER			"AUTH_VOTER"
 #define CPOUT_EN_VOTER				"CPOUT_EN_VOTER"
+#define LL_BPP_CEP_VOTER			"LL_BPP_CEP_VOTER"
 #define WLC_MFG_GOOGLE				0x72
 #define P9221_DC_ICL_BPP_UA			700000
 #define P9221_DC_ICL_BPP_RAMP_DEFAULT_UA	900000
@@ -40,6 +41,7 @@
 #define P9221_DC_ICL_RTX_UA			600000
 #define P9221_AUTH_DC_ICL_UA_500		500000
 #define P9221_AUTH_DC_ICL_UA_100		100000
+#define P9221_LL_BPP_CHG_TERM_UA		200000
 #define P9221_EPP_THRESHOLD_UV			7000000
 #define P9221_MAX_VOUT_SET_MV_DEFAULT		9000
 #define P9221_VOUT_SET_MIN_MV			3500
@@ -69,6 +71,7 @@
 #define P9221_NEG_POWER_5W		(5 / 0.5)
 #define P9221_NEG_POWER_10W		(10 / 0.5)
 #define P9221_PTMC_EPP_TX_1912		0x32
+#define P9221_PTMC_EPP_TX_4191		0x50
 
 #define P9XXX_DC_ICL_EPP_1000		1000000
 #define P9XXX_DC_ICL_EPP_750		750000
@@ -437,6 +440,8 @@
 #define PROP_MODE_EN_CMD			BIT(8)
 #define PROP_REQ_PWR_CMD			BIT(9)
 #define P9412_COM_CCACTIVATE			BIT(10)
+/* For tx cmd register */
+#define P9412_CMD_TXMODE_EXIT			BIT(9)
 /* For INT status register */
 #define P9412_STAT_PPRCVD			BIT(15)
 #define P9412_CDMODE_ERROR_INT			BIT(14)
@@ -566,6 +571,8 @@ struct p9221_charger_platform_data {
 	int				dc_switch_gpio;
 	int				qi_vbus_en;
 	int				qi_vbus_en_act_low;
+	int				wlc_en;
+	int				wlc_en_act_low;
 	int				max_vout_mv;
 	int				epp_vout_mv;
 	u8				fod[P9221R5_NUM_FOD];
@@ -574,7 +581,8 @@ struct p9221_charger_platform_data {
 	int				fod_num;
 	int				fod_epp_num;
 	int				fod_hpp_num;
-	int 				q_value;
+	int				q_value;
+	int				tx_4191q;
 	int				epp_rp_value;
 	int				needs_dcin_reset;
 	int				nb_alignment_freq;
@@ -592,8 +600,7 @@ struct p9221_charger_platform_data {
 	u32				alignment_offset_high_current;
 	u32				alignment_current_threshold;
 	bool				feat_compat_mode;
-	/* Support P9412 GPIO */
-	bool				has_p9412_gpio;
+	bool				apbst_en;
 };
 
 struct p9221_charger_ints_bit {
@@ -635,12 +642,13 @@ struct p9221_charger_data {
 	struct power_supply		*wc_psy;
 	struct power_supply		*dc_psy;
 	struct power_supply		*fg_psy;
-	struct votable			*dc_icl_votable;
-	struct votable			*dc_suspend_votable;
-	struct votable			*tx_icl_votable;
-	struct votable			*disable_dcin_en_votable;
-	struct votable			*chg_mode_votable;
-	struct votable			*wlc_disable_votable;
+	struct gvotable_election	*dc_icl_votable;
+	struct gvotable_election	*dc_suspend_votable;
+	struct gvotable_election	*tx_icl_votable;
+	struct gvotable_election	*disable_dcin_en_votable;
+	struct gvotable_election	*chg_mode_votable;
+	struct gvotable_election	*wlc_disable_votable;
+	struct gvotable_election	*csi_status_votable;
 	struct notifier_block		nb;
 	struct mutex			io_lock;
 	struct mutex			cmd_lock;

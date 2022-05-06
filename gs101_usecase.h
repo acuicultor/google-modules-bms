@@ -12,9 +12,11 @@ struct max77759_usecase_data {
 
 	int bst_on;		/* ext boost */
 	int bst_sel;		/* 5V or 7.5V */
-	int apbst_on;		/* AP boost ping */
 	int ext_bst_ctl;	/* MW VENDOR_EXTBST_CTRL */
 	int otg_enable;		/* enter/exit from OTG cases */
+	bool rx_otg_en;		/* enable WLC_RX -> WLC_RX + OTG case */
+	bool ext_otg_only;	/* use external OTG only */
+	int pogo_ovp_en;	/* pogo ovp */
 
 	int ls2_en;		/* OVP LS2, rtx case */
 	int sw_en;		/* OVP SW Enable, rtx+otg case */
@@ -42,6 +44,7 @@ struct max77759_usecase_data {
 	int use_case;
 
 	bool dcin_is_dock;
+	bool wlctx_bst_en_first;
 };
 
 enum gsu_usecases {

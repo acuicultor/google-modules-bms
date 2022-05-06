@@ -43,11 +43,7 @@
 /* TODO: link to the structure used to save this*/
 #define BATT_ONE_HIST_LEN	12
 /* TODO: this depends on the EEPROM size */
-#define BATT_TOTAL_HIST_LEN	924
-/* TODO: this depends on the EEPROM size */
-#define BATT_MAX_HIST_CNT	\
-		(BATT_TOTAL_HIST_LEN / BATT_ONE_HIST_LEN) // 77
-
+#define BATT_MAX_HIST_CNT	75
 
 #define GBMS_CCBIN_BUCKET_COUNT	10
 
@@ -62,6 +58,7 @@
 typedef uint32_t gbms_tag_t;
 
 enum gbms_tags {
+	GBMS_TAG_ACIM = 0x4143494d, /* Activation Impedance */
 	GBMS_TAG_BCNT = 0x42434e54,
 	GBMS_TAG_BGCE = 0x42474345,
 	GBMS_TAG_BGPN = 0x4247504e,
@@ -82,6 +79,7 @@ enum gbms_tags {
 	GBMS_TAG_MINF = 0x4d494e46,
 	GBMS_TAG_MXSN = 0x4d58534e,
 	GBMS_TAG_MXCN = 0x4d58434e,
+	GBMS_TAG_THAS = 0x54484153,
 
 	/* User Space Read/Write scratch */
 	GBMS_TAG_RS32 = 0x52533332,
@@ -104,6 +102,7 @@ enum gbms_tags {
 	GBMS_TAG_SNUM = 0x534e554d,
 
 	GBMS_TAG_STRD = 0x53545244, /* LOTRV1: Swelling data */
+	GBMS_TAG_RSOC = 0x52534F43,
 };
 
 /*
