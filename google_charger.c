@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /*
- * Copyright 2018 Google, LLC
+ * Copyright 2018-2022 Google LLC
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -1465,13 +1465,15 @@ static int thermal_stats_lvl_to_vtier(int thermal_level) {
 	}
 }
 
-static void msc_temp_defend_dryrun_cb(struct gvotable_election *el,
-				      const char *reason, void *vote)
+static int msc_temp_defend_dryrun_cb(struct gvotable_election *el,
+				     const char *reason, void *vote)
 {
 	struct chg_drv *chg_drv = gvotable_get_data(el);
 	int is_dry_run = GVOTABLE_PTR_TO_INT(vote);
 
 	chg_drv->bd_state.bd_temp_dry_run = !!is_dry_run;
+
+	return 0;
 }
 
 /* bd_state->triggered = 1 when charging needs to be disabled */
@@ -1820,6 +1822,26 @@ static void bd_dd_init(struct chg_drv *chg_drv)
 		bd_state->dd_state, bd_state->dd_settings);
 }
 
+static int bd_dd_state_update(const int dd_state, const bool dd_triggered, const bool change)
+{
+	int new_state = dd_state;
+
+	switch (new_state) {
+	case DOCK_DEFEND_ENABLED:
+		if (dd_triggered && change)
+			new_state = DOCK_DEFEND_ACTIVE;
+		break;
+	case DOCK_DEFEND_ACTIVE:
+		if (!dd_triggered)
+			new_state = DOCK_DEFEND_ENABLED;
+		break;
+	default:
+		break;
+	}
+
+	return new_state;
+}
+
 #define dd_is_enabled(bd_state) \
 	((bd_state)->dd_state != DOCK_DEFEND_DISABLED && \
 	(bd_state)->dd_settings == DOCK_DEFEND_USER_ENABLED)
@@ -1827,8 +1849,8 @@ static void bd_dd_run_defender(struct chg_drv *chg_drv, int soc, int *disable_ch
 {
 	struct bd_data *bd_state = &chg_drv->bd_state;
 	const bool was_triggered = bd_state->dd_triggered;
-	const int upperbd = chg_drv->bd_state.dd_charge_stop_level;
-	const int lowerbd = chg_drv->bd_state.dd_charge_start_level;
+	const int upperbd = bd_state->dd_charge_stop_level;
+	const int lowerbd = bd_state->dd_charge_start_level;
 
 	bd_state->dd_triggered = dd_is_enabled(bd_state) ?
 				 chg_is_custom_enabled(upperbd, lowerbd) : false;
@@ -1837,6 +1859,11 @@ static void bd_dd_run_defender(struct chg_drv *chg_drv, int soc, int *disable_ch
 		*disable_charging = bd_recharge_logic(bd_state, soc);
 	if (*disable_charging)
 		*disable_pwrsrc = soc > bd_state->dd_charge_stop_level;
+
+	/* update dd_state to user space */
+	bd_state->dd_state = bd_dd_state_update(bd_state->dd_state,
+						bd_state->dd_triggered,
+						(soc >= upperbd));
 
 	/* need icl_ramp_work when disable_pwrsrc 1 -> 0 */
 	if (!*disable_pwrsrc && chg_drv->disable_pwrsrc) {
@@ -2188,6 +2215,10 @@ static void chg_work(struct work_struct *work)
 			chg_update_charging_state(chg_drv, false, false);
 			chg_drv->bd_state.dd_triggered = 0;
 		}
+		if (chg_drv->bd_state.dd_settings == DOCK_DEFEND_USER_CLEARED)
+			chg_drv->bd_state.dd_settings = DOCK_DEFEND_USER_ENABLED;
+		if (chg_drv->bd_state.dd_state == DOCK_DEFEND_ACTIVE)
+			chg_drv->bd_state.dd_state = DOCK_DEFEND_ENABLED;
 
 		rc = chg_start_bd_work(chg_drv);
 		if (rc < 0)
@@ -2268,9 +2299,12 @@ static void chg_work(struct work_struct *work)
 		goto rerun_error;
 
 	update_interval = rc;
-	if (update_interval >= 0)
+	if (update_interval >= 0) {
 		chg_done = (chg_drv->chg_state.f.flags &
 			    GBMS_CS_FLAG_DONE) != 0;
+		/* clear rc for exit_chg_work: update correct data */
+		rc = 0;
+	}
 
 	/*
 	 * chg_drv->disable_pwrsrc -> chg_drv->disable_charging
@@ -3007,10 +3041,8 @@ static ssize_t show_dd_state(struct device *dev, struct device_attribute *attr,
 			     char *buf)
 {
 	struct chg_drv *chg_drv = dev_get_drvdata(dev);
-	const int dd_state = chg_drv->bd_state.dd_triggered ?
-			     DOCK_DEFEND_ACTIVE : chg_drv->bd_state.dd_state;
 
-	return scnprintf(buf, PAGE_SIZE, "%d\n", dd_state);
+	return scnprintf(buf, PAGE_SIZE, "%d\n", chg_drv->bd_state.dd_state);
 }
 
 static ssize_t set_dd_state(struct device *dev, struct device_attribute *attr,
@@ -3883,8 +3915,8 @@ static int msc_update_pps(struct chg_drv *chg_drv, int fv_uv, int cc_max)
  * NOTE: chg_work() vote 0 at the beginning of each loop to gate the updates
  * to the charger
  */
-static void msc_update_charger_cb(struct gvotable_election *el,
-				  const char *reason, void *vote)
+static int msc_update_charger_cb(struct gvotable_election *el,
+				 const char *reason, void *vote)
 {
 	int update_interval, rc = -EINVAL, fv_uv = -1, cc_max = -1, topoff = -1;
 	struct chg_drv *chg_drv = gvotable_get_data(el);
@@ -3947,38 +3979,43 @@ msc_reschedule:
 
 msc_done:
 	__pm_relax(chg_drv->chg_ws);
+	return 0;
 }
 
 /*
  * NOTE: we need a single source of truth. Charging can be disabled via the
  * votable and directy setting the property.
  */
-static void msc_chg_disable_cb(struct gvotable_election *el,
-			       const char *reason, void *vote)
+static int msc_chg_disable_cb(struct gvotable_election *el,
+			      const char *reason, void *vote)
 {
 	struct chg_drv *chg_drv = gvotable_get_data(el);
 	int chg_disable = GVOTABLE_PTR_TO_INT(vote);
 	int rc;
 
 	if (!chg_drv->chg_psy)
-		return;
+		return 0;
 
 	rc = GPSY_SET_PROP(chg_drv->chg_psy, GBMS_PROP_CHARGE_DISABLE, chg_disable);
 	if (rc < 0)
 		dev_err(chg_drv->device, "Couldn't %s charging rc=%d\n",
 				chg_disable ? "disable" : "enable", rc);
+
+	return 0;
 }
 
-static void msc_pwr_disable_cb(struct gvotable_election *el,
-			       const char *reason, void *vote)
+static int msc_pwr_disable_cb(struct gvotable_election *el,
+			      const char *reason, void *vote)
 {
 	struct chg_drv *chg_drv = gvotable_get_data(el);
 	int pwr_disable = GVOTABLE_PTR_TO_INT(vote);
 
 	if (!chg_drv->chg_psy)
-		return;
+		return 0;
 
 	chg_vote_input_suspend(chg_drv, MSC_CHG_VOTER, pwr_disable);
+
+	return 0;
 }
 
 static int chg_disable_std_votables(struct chg_drv *chg_drv)
@@ -4047,6 +4084,7 @@ static int chg_create_votables(struct chg_drv *chg_drv)
 	}
 
 	gvotable_set_vote2str(chg_drv->msc_fv_votable, gvotable_v2s_int);
+	gvotable_disable_force_int_entry(chg_drv->msc_fv_votable);
 	gvotable_election_set_name(chg_drv->msc_fv_votable, VOTABLE_MSC_FV);
 
 	chg_drv->msc_fcc_votable =
@@ -4059,6 +4097,7 @@ static int chg_create_votables(struct chg_drv *chg_drv)
 	}
 
 	gvotable_set_vote2str(chg_drv->msc_fcc_votable, gvotable_v2s_int);
+	gvotable_disable_force_int_entry(chg_drv->msc_fcc_votable);
 	gvotable_election_set_name(chg_drv->msc_fcc_votable, VOTABLE_MSC_FCC);
 
 	chg_drv->msc_interval_votable =

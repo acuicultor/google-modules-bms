@@ -224,24 +224,6 @@ struct batt_ttf_stats {
 	struct logbuffer *ttf_log;
 };
 
-#pragma pack(1)
-struct max17x0x_eeprom_history {
-	u16 tempco;
-	u16 rcomp0;
-	u8 timerh;
-	unsigned fullcapnom:10;
-	unsigned fullcaprep:10;
-	unsigned mixsoc:6;
-	unsigned vfsoc:6;
-	unsigned maxvolt:4;
-	unsigned minvolt:4;
-	unsigned maxtemp:4;
-	unsigned mintemp:4;
-	unsigned maxchgcurr:4;
-	unsigned maxdischgcurr:4;
-};
-#pragma pack()
-
 /*
  * health based charging can be enabled from userspace with a deadline
  *
@@ -547,6 +529,27 @@ enum gbms_charger_modes {
 
 #define GBMS_MODE_VOTABLE "CHARGER_MODE"
 
+/* Battery Health */
+enum bhi_algo {
+	BHI_ALGO_DISABLED = 0,
+
+	BHI_ALGO_CYCLE_COUNT	= 1, /* bare, just use cycle count */
+	BHI_ALGO_ACHI		= 2, /* cap avg from history, no resistance */
+	BHI_ALGO_ACHI_B		= 3, /* same as ACHI + bounds check */
+	BHI_ALGO_ACHI_RAVG	= 4, /* same as ACHI and google_resistance */
+	BHI_ALGO_ACHI_RAVG_B	= 5, /* same as ACHI_RAVG + bounds check */
+
+	/* TODO:
+	 * BHI_ALGO_ACHI_QRES	 = 4,  cap avg from history, qual resistance
+	 * BHI_ALGO_ACHI_QRES_B	= 21,  same ACHI_QRES + bounds check
+	 * BHI_ALGO_GCAP_RAVG	= 40,  google_capacity, google_resistance
+	 * BHI_ALGO_GCAP_RAVG_B	= 41,  same as GCAP_RAVG + bounds check
+	 */
+
+	BHI_ALGO_MIX_N_MATCH 	= 6,
+	BHI_ALGO_MAX,
+};
+
 enum bhi_status {
 	BH_UNKNOWN = -1,
 	BH_NOMINAL,
@@ -555,6 +558,7 @@ enum bhi_status {
 	BH_FAILED,
 };
 
+/* Charging Speed */
 enum csi_type {
 	CSI_TYPE_UNKNOWN = -1,
 
@@ -583,5 +587,7 @@ enum csi_status {
 	CSI_STATUS_NotCharging = 100,	// There will be a more specific reason
 	CSI_STATUS_Charging = 200,	// All good
 };
+
+
 
 #endif  /* __GOOGLE_BMS_H_ */
