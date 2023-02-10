@@ -15,6 +15,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/debugfs.h>
 #include <linux/kernel.h>
 #include <linux/printk.h>
 #include <linux/module.h>
@@ -32,6 +33,7 @@
 
 #define DOCK_USER_VOTER			"DOCK_USER_VOTER"
 #define DOCK_AICL_VOTER			"DOCK_AICL_VOTER"
+#define DOCK_VOUT_VOTER			"DOCK_VOUT_VOTER"
 
 #define DOCK_DELAY_INIT_MS		500
 #define DOCK_NOTIFIER_DELAY_MS		100
@@ -40,6 +42,10 @@
 #define DOCK_13_5W_ILIM_UA		1500000
 #define DOCK_13_5W_VOUT_UV		9000000
 #define DOCK_ICL_RAMP_DELAY_DEFAULT_MS	(4 * 1000)	/* 4 seconds */
+
+/* type detection */
+#define EXT_DETECT_DELAY_MS		(1000)
+#define EXT_DETECT_RETRIES		(3)
 
 struct dock_drv {
 	struct device *device;
@@ -50,9 +56,11 @@ struct dock_drv {
 	struct delayed_work init_work;
 	struct delayed_work notifier_work;
 	struct delayed_work icl_ramp_work;
+	struct delayed_work detect_work;
 	struct alarm icl_ramp_alarm;
 	struct notifier_block nb;
 	struct gvotable_election *dc_icl_votable;
+	struct gvotable_election *chg_mode_votable;
 
 	bool init_complete;
 	bool check_dc;
@@ -61,12 +69,43 @@ struct dock_drv {
 	u32 icl_ramp_delay_ms;
 	int online;
 	int pogo_ovp_en;
+	int voltage_max;		/* > 10.5V mean Ext1 else > 5V mean Ext2. */
+	int detect_retries;
+	struct wakeup_source *detect_ws;
 };
 
+/* ------------------------------------------------------------------------- */
+
+static bool google_dock_find_mode_votable(struct dock_drv *dock)
+{
+	if (!dock->chg_mode_votable) {
+		dock->chg_mode_votable = gvotable_election_get_handle(GBMS_MODE_VOTABLE);
+		if (!dock->chg_mode_votable) {
+			dev_err(dock->device, "Could not get CHARGER_MODE votable\n");
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static int google_dock_set_pogo_vout(struct dock_drv *dock,
+				     int enabled)
+{
+	if (!google_dock_find_mode_votable(dock))
+		return -EINVAL;
+
+	dev_dbg(dock->device, "pogo_vout_enabled=%d\n", enabled);
+
+	return gvotable_cast_long_vote(dock->chg_mode_votable,
+				       DOCK_VOUT_VOTER,
+				       GBMS_POGO_VOUT,
+				       enabled != 0);
+}
 
 /* ------------------------------------------------------------------------- */
 static ssize_t is_dock_show(struct device *dev,
-			   struct device_attribute *attr, char *buf)
+			    struct device_attribute *attr, char *buf)
 {
 	struct power_supply *psy = container_of(dev, struct power_supply, dev);
 	struct dock_drv *dock = power_supply_get_drvdata(psy);
@@ -79,6 +118,24 @@ static ssize_t is_dock_show(struct device *dev,
 
 static DEVICE_ATTR_RO(is_dock);
 
+static int debug_pogo_vout_write(void *data, u64 val)
+{
+	struct dock_drv *dock = (struct dock_drv *)data;
+	int ret;
+
+	if (val < 0 || val > 1)
+		return -EINVAL;
+
+	ret = google_dock_set_pogo_vout(dock, val);
+	if (ret)
+		dev_err(dock->device, "Failed to set pogo vout: %d\n", ret);
+
+	return 0;
+}
+
+DEFINE_SIMPLE_ATTRIBUTE(debug_pogo_vout_fops, NULL,
+			debug_pogo_vout_write, "%llu\n");
+
 static int dock_init_fs(struct dock_drv *dock)
 {
 	int ret;
@@ -89,6 +146,21 @@ static int dock_init_fs(struct dock_drv *dock)
 		dev_err(&dock->psy->dev, "Failed to create is_dock\n");
 
 	return ret;
+}
+
+static int dock_init_debugfs(struct dock_drv *dock)
+{
+	struct dentry *de = NULL;
+
+	de = debugfs_create_dir("google_dock", 0);
+	if (IS_ERR_OR_NULL(de))
+		return 0;
+
+	/* pogo_vout */
+	debugfs_create_file("pogo_vout", 0600, de, dock,
+			    &debug_pogo_vout_fops);
+
+	return 0;
 }
 /* ------------------------------------------------------------------------- */
 
@@ -226,9 +298,13 @@ static void google_dock_notifier_check_dc(struct dock_drv *dock)
 		google_dock_set_icl(dock);
 		google_dock_icl_ramp_reset(dock);
 		google_dock_icl_ramp_start(dock);
+		dock->voltage_max = -1;		/* Dock detection started, but not done */
+		schedule_delayed_work(&dock->detect_work,
+				msecs_to_jiffies(EXT_DETECT_DELAY_MS));
 	} else {
 		google_dock_vote_defaults(dock);
 		google_dock_icl_ramp_reset(dock);
+		dock->voltage_max = 0;
 
 		dev_info(dock->device, "%s: online: %d->0\n",
 			 __func__, dock->online);
@@ -272,7 +348,7 @@ out:
 }
 
 static int google_dock_parse_dt(struct device *dev,
-			  struct dock_drv *dock)
+				struct dock_drv *dock)
 {
 	int ret = 0;
 	struct device_node *node = dev->of_node;
@@ -331,6 +407,10 @@ static int dock_get_property(struct power_supply *psy,
 
 		/* success */
 		ret = 0;
+		break;
+
+	case POWER_SUPPLY_PROP_VOLTAGE_MAX:
+		val->intval = dock->voltage_max;
 		break;
 
 	default:
@@ -438,6 +518,7 @@ static void google_dock_init_work(struct work_struct *work)
 	}
 
 	(void)dock_init_fs(dock);
+	(void)dock_init_debugfs(dock);
 
 	dock->init_complete = true;
 	dev_info(dock->device, "google_dock_init_work done\n");
@@ -447,6 +528,52 @@ static void google_dock_init_work(struct work_struct *work)
 retry_init_work:
 	schedule_delayed_work(&dock->init_work,
 			      msecs_to_jiffies(DOCK_DELAY_INIT_MS));
+}
+
+static void google_dock_detect_work(struct work_struct *work)
+{
+	struct dock_drv *dock = container_of(work, struct dock_drv,
+					     detect_work.work);
+	union power_supply_propval val;
+	int err = 0;
+
+	if (!dock->dc_psy)
+		return;
+
+	__pm_stay_awake(dock->detect_ws);
+	err = power_supply_get_property(dock->dc_psy, POWER_SUPPLY_PROP_PRESENT, &val);
+	if (err < 0 || val.intval == 0) {
+		if (err < 0)
+			dev_dbg(dock->device, "Error getting charging status: %d\n", err);
+		else
+			dev_dbg(dock->device, "dc_psy not present. Retrying detection\n");
+		goto dock_detect_retry;
+	}
+
+	err = power_supply_get_property(dock->dc_psy, POWER_SUPPLY_PROP_VOLTAGE_NOW, &val);
+	if (err) {
+		if (err != -EAGAIN)
+			dev_dbg(dock->device, "failed to read dc supply voltage err: %d\n", err);
+
+		goto dock_detect_retry;
+	}
+
+	dev_info(dock->device, "dc_psy v=%d, retries=%d\n", val.intval, dock->detect_retries);
+
+	dock->voltage_max = val.intval;
+	dock->detect_retries = EXT_DETECT_RETRIES;
+	__pm_relax(dock->detect_ws);
+	power_supply_changed(dock->psy);
+	return;
+
+dock_detect_retry:
+	if (dock->detect_retries) {
+		dock->detect_retries--;
+		schedule_delayed_work(&dock->detect_work, msecs_to_jiffies(EXT_DETECT_DELAY_MS));
+	} else {
+		dock->detect_retries = EXT_DETECT_RETRIES;
+		__pm_relax(dock->detect_ws);
+	}
 }
 
 static int google_dock_probe(struct platform_device *pdev)
@@ -478,11 +605,21 @@ static int google_dock_probe(struct platform_device *pdev)
 	mutex_init(&dock->dock_lock);
 	INIT_DELAYED_WORK(&dock->init_work, google_dock_init_work);
 	INIT_DELAYED_WORK(&dock->icl_ramp_work, google_dock_icl_ramp_work);
+	INIT_DELAYED_WORK(&dock->detect_work, google_dock_detect_work);
 	alarm_init(&dock->icl_ramp_alarm, ALARM_BOOTTIME,
 		   google_dock_icl_ramp_alarm_cb);
 
 	dock->icl_ramp_delay_ms = DOCK_ICL_RAMP_DELAY_DEFAULT_MS;
 	dock->online = 0;
+
+	dock->voltage_max = 0;
+	dock->detect_retries = EXT_DETECT_RETRIES;
+
+	dock->detect_ws = wakeup_source_register(NULL, "Detect");
+	if (!dock->detect_ws) {
+		dev_err(dock->device, "Failed to register dock detect wakeup source\n");
+		return -ENOMEM;
+	}
 
 	platform_set_drvdata(pdev, dock);
 
@@ -539,6 +676,8 @@ static int google_dock_remove(struct platform_device *pdev)
 	cancel_delayed_work(&dock->notifier_work);
 	cancel_delayed_work(&dock->icl_ramp_work);
 	alarm_try_to_cancel(&dock->icl_ramp_alarm);
+	cancel_delayed_work(&dock->detect_work);
+	wakeup_source_unregister(dock->detect_ws);
 
 	return 0;
 }

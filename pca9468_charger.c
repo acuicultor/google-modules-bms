@@ -20,6 +20,7 @@
 #include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/rtc.h>
+#include <misc/gvotable.h>
 
 #include "pca9468_regs.h"
 #include "pca9468_charger.h"
@@ -38,8 +39,9 @@ static int adc_gain[16] = { 0,  1,  2,  3,  4,  5,  6,  7,
 #define PCA9468_CCMODE_CHECK1_T	5000	/* 10000ms -> 500ms */
 #define PCA9468_CCMODE_CHECK2_T	5000	/* 5000ms */
 #define PCA9468_CVMODE_CHECK_T 	10000	/* 10000ms */
-#define PCA4968_ENABLE_DELAY_T	150	/* 150ms */
+#define PCA9468_ENABLE_DELAY_T	150	/* 150ms */
 #define PCA9468_CVMODE_CHECK2_T	1000	/* 1000ms */
+#define PCA9468_ENABLE_WLC_DELAY_T	300	/* 300ms */
 
 /* Battery Threshold */
 #define PCA9468_DC_VBAT_MIN		3400000 /* uV */
@@ -3352,9 +3354,25 @@ static int pca9468_preset_dcmode(struct pca9468_charger *pca9468)
 				PCA9468_TA_MAX_CUR);
 			ret = pca9468_get_apdo_max_power(pca9468, ta_max_vol, 0);
 		}
+
 		if (ret < 0) {
+			int ret1;
+
 			pr_err("%s: No APDO to support 2:1\n", __func__);
 			pca9468->chg_mode = CHG_NO_DC_MODE;
+
+			if (!pca9468->dc_avail)
+				pca9468->dc_avail =
+					gvotable_election_get_handle(VOTABLE_DC_CHG_AVAIL);
+
+			if (pca9468->dc_avail) {
+				ret1 = gvotable_cast_int_vote(pca9468->dc_avail,
+							      REASON_DC_DRV, 0, 1);
+				if (ret1 < 0)
+					dev_err(pca9468->dev,
+						"Unable to cast vote for DC Chg avail (%d)\n",
+						ret1);
+			}
 			goto error;
 		}
 
@@ -3414,9 +3432,12 @@ static int pca9468_preset_config(struct pca9468_charger *pca9468)
 	pca9468->prev_iin = 0;
 	pca9468->prev_inc = INC_NONE;
 
-	/* Go to CHECK_ACTIVE state after 150ms*/
+	/* Go to CHECK_ACTIVE state after 150ms, 300ms for wireless */
 	pca9468->timer_id = TIMER_CHECK_ACTIVE;
-	pca9468->timer_period = PCA4968_ENABLE_DELAY_T;
+	if (pca9468->ta_type == TA_TYPE_WIRELESS)
+		pca9468->timer_period = PCA9468_ENABLE_WLC_DELAY_T;
+	else
+		pca9468->timer_period = PCA9468_ENABLE_DELAY_T;
 	mod_delayed_work(pca9468->dc_wq, &pca9468->timer_work,
 			   msecs_to_jiffies(pca9468->timer_period));
 error:
@@ -3856,6 +3877,7 @@ error:
 			"%s: timer_id=%d->%d, charging_state=%u->%u, period=%ld ret=%d",
 			__func__, timer_id, pca9468->timer_id, charging_state,
 			pca9468->charging_state, pca9468->timer_period, ret);
+
 	pca9468_stop_charging(pca9468);
 }
 
@@ -4303,6 +4325,20 @@ static int pca9468_mains_set_property(struct power_supply *psy,
 				       __func__, ret);
 
 			pca9468->mains_online = false;
+
+			/* Reset DC Chg un-avail on disconnect */
+			if (!pca9468->dc_avail)
+				pca9468->dc_avail =
+				gvotable_election_get_handle(VOTABLE_DC_CHG_AVAIL);
+
+			if (pca9468->dc_avail) {
+				ret = gvotable_cast_int_vote(pca9468->dc_avail,
+							     REASON_DC_DRV, 1, 1);
+				if (ret < 0)
+					dev_err(pca9468->dev,
+						"Unable to cast vote for DC Chg avail (%d)\n",
+						ret);
+			}
 		} else if (pca9468->mains_online == false) {
 			pca9468->mains_online = true;
 		}
@@ -5079,6 +5115,9 @@ static int pca9468_probe(struct i2c_client *client,
 		}
 	}
 #endif
+
+	pca9468_chg->dc_avail = NULL;
+
 	pca9468_chg->init_done = true;
 	pr_info("pca9468: probe_done\n");
 	pr_debug("%s: =========END=========\n", __func__);
